@@ -59,7 +59,11 @@ class ExifExtractor:
     @classmethod
     def _extract_from_jpeg(cls, f: BinaryIO) -> datetime | None:
         """Extract EXIF date from JPEG file."""
-        # Skip to APP1 marker
+        # Position after SOI marker (already read 12 bytes in extract_date)
+        # Need to seek back to after SOI (position 2) to scan markers
+        f.seek(2)
+        
+        # Scan for APP1 marker
         while True:
             marker = f.read(2)
             if len(marker) < 2:
