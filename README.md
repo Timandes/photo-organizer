@@ -33,6 +33,22 @@ uv tool install .
 uv tool install git+https://github.com/your-repo/photo-organizer.git
 ```
 
+## 更新
+
+```bash
+# 从本地更新（重新安装）
+uv tool install . --reinstall --force
+
+# 从 Git 仓库更新到最新版本
+uv tool install git+https://github.com/your-repo/photo-organizer.git --reinstall --force
+```
+
+## 卸载
+
+```bash
+uv tool uninstall photo-organizer
+```
+
 ## 使用方法
 
 ```bash
