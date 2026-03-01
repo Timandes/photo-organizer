@@ -32,6 +32,10 @@ class Organizer:
         self.moved = 0
         self.skipped = 0
         self.errors = 0
+        
+        # Track moved files for AAE companion lookup
+        # Maps original filename -> new path
+        self._moved_files: dict[str, Path] = {}
 
     def scan_files(self, directory: Path) -> list[Path]:
         """Scan directory for files (non-recursive).
@@ -69,6 +73,11 @@ class Organizer:
     def find_companion_media(self, aae_path: Path) -> Path | None:
         """Find companion media file for an AAE file.
         
+        Searches in:
+        1. Current directory
+        2. Already-moved files (tracked during this run)
+        3. Date subdirectories (from previous runs)
+        
         Args:
             aae_path: Path to the AAE file
             
@@ -78,13 +87,41 @@ class Organizer:
         stem = aae_path.stem  # e.g., "IMG_9310" from "IMG_9310.AAE"
         parent = aae_path.parent
         
-        # Search for matching media file (case-insensitive)
+        # 1. Search for matching media file in current directory
         for item in parent.iterdir():
             if item.is_file() and item.suffix.lower() in self.MEDIA_EXTENSIONS:
                 if item.stem == stem:
                     return item
         
+        # 2. Check if companion was already moved in this run
+        for ext in self.MEDIA_EXTENSIONS:
+            # Try both lowercase and uppercase extensions
+            for candidate_name in [stem + ext, stem + ext.upper()]:
+                if candidate_name in self._moved_files:
+                    return self._moved_files[candidate_name]
+        
+        # 3. Search date subdirectories (YYYY.MM.DD format)
+        for item in parent.iterdir():
+            if item.is_dir() and self._is_date_directory(item.name):
+                for media_item in item.iterdir():
+                    if (media_item.is_file() and 
+                        media_item.suffix.lower() in self.MEDIA_EXTENSIONS and
+                        media_item.stem == stem):
+                        return media_item
+        
         return None
+    
+    @staticmethod
+    def _is_date_directory(name: str) -> bool:
+        """Check if directory name matches date format YYYY.MM.DD."""
+        parts = name.split('.')
+        if len(parts) != 3:
+            return False
+        try:
+            year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+            return 1900 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31
+        except ValueError:
+            return False
 
     def get_date(self, file_path: Path) -> tuple[datetime, str] | None:
         """Extract date from file metadata.
@@ -227,6 +264,8 @@ class Organizer:
         relative_target = target_path.relative_to(file_path.parent)
         if self.dry_run:
             print(f"[DRY-RUN] {file_path.name} -> {relative_target} ({date_type})")
+            # Record planned move for AAE companion lookup
+            self._moved_files[file_path.name] = target_path
         else:
             print(f"{file_path.name} -> {relative_target} ({date_type})")
             # Create target directory
@@ -235,6 +274,8 @@ class Organizer:
             try:
                 shutil.move(str(file_path), str(target_path))
                 self.moved += 1
+                # Record move for AAE companion lookup
+                self._moved_files[file_path.name] = target_path
             except OSError as e:
                 logger.error(f"Failed to move {file_path.name}: {e}")
                 self.errors += 1
