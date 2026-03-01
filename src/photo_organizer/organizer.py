@@ -56,7 +56,7 @@ class Organizer:
             files.append(item)
         return sorted(files)
 
-    def get_date(self, file_path: Path) -> datetime | None:
+    def get_date(self, file_path: Path) -> tuple[datetime, str] | None:
         """Extract date from file metadata.
         
         Priority:
@@ -68,30 +68,25 @@ class Organizer:
             file_path: Path to the file
             
         Returns:
-            datetime object or None if date cannot be determined
+            Tuple of (datetime, date_type) or None if date cannot be determined
+            date_type is one of: "创建媒体日期", "拍摄日期", "文件系统日期"
         """
         # Try EXIF extractor for images
         if ExifExtractor.can_handle(file_path):
             dt = ExifExtractor.extract_date(file_path)
             if dt:
-                if self.verbose:
-                    logger.info(f"  EXIF date: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                return dt
+                return (dt, "创建媒体日期")
 
         # Try QuickTime extractor for videos
         if QuickTimeExtractor.can_handle(file_path):
             dt = QuickTimeExtractor.extract_date(file_path)
             if dt:
-                if self.verbose:
-                    logger.info(f"  QuickTime date: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
-                return dt
+                return (dt, "创建媒体日期")
 
         # Fallback to file system time
         dt = get_filesystem_date(file_path)
         if dt:
-            if self.verbose:
-                logger.info(f"  Filesystem date: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
-            return dt
+            return (dt, "文件系统日期")
 
         return None
 
@@ -150,11 +145,13 @@ class Organizer:
         self.processed += 1
         
         # Get date
-        dt = self.get_date(file_path)
-        if not dt:
+        result = self.get_date(file_path)
+        if not result:
             logger.warning(f"Cannot determine date for: {file_path.name}")
             self.skipped += 1
             return False
+        
+        dt, date_type = result
 
         # Get target path
         target_path = self.get_target_path(file_path, dt)
@@ -173,9 +170,9 @@ class Organizer:
         # Log action
         relative_target = target_path.relative_to(file_path.parent)
         if self.dry_run:
-            print(f"[DRY-RUN] {file_path.name} -> {relative_target}")
+            print(f"[DRY-RUN] {file_path.name} -> {relative_target} ({date_type})")
         else:
-            print(f"{file_path.name} -> {relative_target}")
+            print(f"{file_path.name} -> {relative_target} ({date_type})")
             # Create target directory
             target_path.parent.mkdir(parents=True, exist_ok=True)
             # Move file
