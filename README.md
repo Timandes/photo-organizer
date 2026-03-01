@@ -30,7 +30,7 @@
 uv tool install .
 
 # 或从 Git 仓库安装
-uv tool install git+https://github.com/your-repo/photo-organizer.git
+uv tool install git+https://github.com/Timandes/photo-organizer.git
 ```
 
 ## 更新
@@ -40,7 +40,7 @@ uv tool install git+https://github.com/your-repo/photo-organizer.git
 uv tool install . --reinstall --force
 
 # 从 Git 仓库更新到最新版本
-uv tool install git+https://github.com/your-repo/photo-organizer.git --reinstall --force
+uv tool install git+https://github.com/Timandes/photo-organizer.git --reinstall --force
 ```
 
 ## 卸载
