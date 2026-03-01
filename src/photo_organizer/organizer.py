@@ -56,20 +56,76 @@ class Organizer:
             files.append(item)
         return sorted(files)
 
+    # AAE files are Apple photo edit sidecar files
+    AAE_EXTENSION = '.aae'
+    
+    # Supported media extensions for AAE companion lookup
+    MEDIA_EXTENSIONS = {
+        '.jpg', '.jpeg', '.heic', '.heif', '.png', '.tiff', '.tif',
+        '.webp', '.cr2', '.nef', '.arw', '.dng', '.raw',
+        '.mp4', '.mov', '.3gp', '.3g2', '.m4v', '.m4a',
+    }
+
+    def find_companion_media(self, aae_path: Path) -> Path | None:
+        """Find companion media file for an AAE file.
+        
+        Args:
+            aae_path: Path to the AAE file
+            
+        Returns:
+            Path to companion media file, or None if not found
+        """
+        stem = aae_path.stem  # e.g., "IMG_9310" from "IMG_9310.AAE"
+        parent = aae_path.parent
+        
+        # Search for matching media file (case-insensitive)
+        for item in parent.iterdir():
+            if item.is_file() and item.suffix.lower() in self.MEDIA_EXTENSIONS:
+                if item.stem == stem:
+                    return item
+        
+        return None
+
     def get_date(self, file_path: Path) -> tuple[datetime, str] | None:
         """Extract date from file metadata.
         
         Priority:
-        1. EXIF metadata (images)
-        2. QuickTime metadata (videos)
-        3. File system time (fallback)
+        1. AAE: use companion media file date
+        2. EXIF metadata (images)
+        3. QuickTime metadata (videos)
+        4. File system time (fallback)
         
         Args:
             file_path: Path to the file
             
         Returns:
             Tuple of (datetime, date_type) or None if date cannot be determined
-            date_type is one of: "创建媒体日期", "拍摄日期", "文件系统日期"
+            date_type is one of: "创建媒体日期", "跟随主媒体", "文件系统日期"
+        """
+        # Handle AAE files - use companion media file's date
+        if file_path.suffix.lower() == self.AAE_EXTENSION:
+            companion = self.find_companion_media(file_path)
+            if companion:
+                result = self._get_media_date(companion)
+                if result:
+                    dt, _ = result
+                    return (dt, "跟随主媒体")
+            # No companion found, fallback to filesystem date
+            dt = get_filesystem_date(file_path)
+            if dt:
+                return (dt, "文件系统日期")
+            return None
+
+        return self._get_media_date(file_path)
+    
+    def _get_media_date(self, file_path: Path) -> tuple[datetime, str] | None:
+        """Extract date from media file metadata.
+        
+        Args:
+            file_path: Path to the media file
+            
+        Returns:
+            Tuple of (datetime, date_type) or None
         """
         # Try EXIF extractor for images
         if ExifExtractor.can_handle(file_path):
