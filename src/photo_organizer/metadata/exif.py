@@ -93,6 +93,11 @@ class ExifExtractor:
         # Parse ISO base media file format boxes
         f.seek(0)
         
+        # First pass: find meta box and exif location
+        meta_offset = None
+        meta_size = None
+        exif_location = None
+        
         while True:
             box_header = f.read(8)
             if len(box_header) < 8:
@@ -101,54 +106,252 @@ class ExifExtractor:
             size, box_type = struct.unpack('>I4s', box_header)
             
             if size == 0:
-                # Box extends to end of file
                 break
             elif size == 1:
-                # Extended size
                 size = struct.unpack('>Q', f.read(8))[0]
             
             if box_type == b'meta':
-                # Meta box contains EXIF
-                return cls._parse_heic_meta(f, size - 8)
+                meta_offset = f.tell()
+                meta_size = size - 8
+                # Parse meta box to find exif location
+                exif_location = cls._parse_heic_meta_for_exif(f, size - 8)
+                if exif_location:
+                    # Read exif data from location
+                    f.seek(exif_location)
+                    exif_data = f.read(cls.MAX_EXIF_SIZE)
+                    
+                    # HEIC Exif item may have a 4-byte prefix before Exif header
+                    # Format: [4 bytes: offset/size] [Exif\x00\x00] [TIFF data]
+                    # or: [Exif\x00\x00] [TIFF data]
+                    # or: [TIFF data directly]
+                    
+                    tiff_data = None
+                    
+                    # Check for 4-byte prefix + Exif header
+                    if len(exif_data) > 10 and exif_data[4:10] == b'Exif\x00\x00':
+                        tiff_data = exif_data[10:]
+                    # Check for direct Exif header
+                    elif exif_data[:6] == b'Exif\x00\x00':
+                        tiff_data = exif_data[6:]
+                    # Check for direct TIFF header (II or MM)
+                    elif exif_data[:2] in (b'II', b'MM'):
+                        tiff_data = exif_data
+                    # Check for prefix + TIFF (without Exif header)
+                    elif len(exif_data) > 6 and exif_data[4:6] in (b'II', b'MM'):
+                        tiff_data = exif_data[4:]
+                    
+                    if tiff_data:
+                        return cls._parse_tiff_exif(tiff_data)
+                break
             else:
-                # Skip to next box
                 f.seek(size - 8, 1)
         
         return None
 
     @classmethod
-    def _parse_heic_meta(cls, f: BinaryIO, remaining: int) -> datetime | None:
-        """Parse HEIC meta box for EXIF data."""
-        # Read meta box content (limited)
-        meta_data = f.read(min(remaining, cls.MAX_EXIF_SIZE))
+    def _parse_heic_meta_for_exif(cls, f: BinaryIO, remaining: int) -> int | None:
+        """Parse HEIC meta box to find EXIF item location.
         
-        # Look for Exif item in iloc/infe boxes
-        # This is a simplified parser - look for Exif payload
-        pos = 0
-        while pos < len(meta_data) - 8:
-            try:
-                size, box_type = struct.unpack('>I4s', meta_data[pos:pos+8])
-                if size < 8:
-                    break
-                
-                if box_type == b'iloc':
-                    # Item location box - find Exif item
-                    pass
-                elif box_type == b'iinf':
-                    # Item info box
-                    pass
-                elif box_type == b'iprp':
-                    # Item properties - may contain Exif data
-                    # Search for Exif TIFF header in remaining data
-                    exif_pos = meta_data.find(b'Exif\x00\x00', pos)
-                    if exif_pos >= 0:
-                        tiff_data = meta_data[exif_pos + 6:]
-                        if len(tiff_data) > 8:
-                            return cls._parse_tiff_exif(tiff_data)
-                
-                pos += size
-            except struct.error:
+        Returns the file offset where EXIF data starts, or None.
+        """
+        # meta box: version(1) + flags(3) + boxes...
+        version_flags = f.read(4)
+        if len(version_flags) < 4:
+            return None
+        remaining -= 4
+        
+        exif_item_id = None
+        iloc_data = None
+        
+        # Parse sub-boxes to find iinf (for exif item id) and iloc (for location)
+        while remaining > 8:
+            box_header = f.read(8)
+            if len(box_header) < 8:
                 break
+            
+            size, box_type = struct.unpack('>I4s', box_header)
+            if size < 8 or size > remaining:
+                break
+            
+            box_start = f.tell()
+            box_content_size = size - 8
+            
+            if box_type == b'iinf':
+                # Item Info box - find Exif item
+                exif_item_id = cls._parse_iinf_for_exif(f, box_content_size)
+            
+            elif box_type == b'iloc':
+                # Item Location box - read for later processing
+                iloc_data = f.read(box_content_size)
+            
+            else:
+                f.seek(box_content_size, 1)
+            
+            remaining -= size
+        
+        # If we found both exif item id and iloc data, find the location
+        if exif_item_id is not None and iloc_data:
+            return cls._find_exif_location_in_iloc(iloc_data, exif_item_id)
+        
+        return None
+
+    @classmethod
+    def _parse_iinf_for_exif(cls, f: BinaryIO, size: int) -> int | None:
+        """Parse iinf box to find Exif item ID."""
+        # iinf: version(1) + flags(3) + entry_count(2) + infe boxes...
+        version_flags = f.read(4)
+        if len(version_flags) < 4:
+            return None
+        
+        entry_count = struct.unpack('>H', f.read(2))[0]
+        remaining = size - 6
+        
+        result = None
+        
+        for _ in range(entry_count):
+            if remaining < 8:
+                break
+            box_header = f.read(8)
+            if len(box_header) < 8:
+                break
+            
+            box_size, box_type = struct.unpack('>I4s', box_header)
+            if box_size < 8 or box_size > remaining:
+                break
+            
+            if box_type == b'infe':
+                # infe: version(1) + flags(3) + item_id(2) + item_protection_index(2) + item_type(4) + item_name...
+                version = f.read(1)
+                if version == b'\x02':
+                    # Version 2 format
+                    f.read(3)  # flags
+                    item_id = struct.unpack('>H', f.read(2))[0]
+                    f.read(2)  # protection index
+                    item_type = f.read(4)
+                    if item_type == b'Exif':
+                        result = item_id
+                        # Don't return immediately - need to skip remaining data first
+                    # Skip rest of box
+                    f.seek(box_size - 8 - 12, 1)
+                else:
+                    # Version 0/1 format or unknown, skip
+                    f.seek(box_size - 8 - 1, 1)
+            else:
+                f.seek(box_size - 8, 1)
+            
+            remaining -= box_size
+        
+        # Skip any remaining bytes in iinf box
+        if remaining > 0:
+            f.seek(remaining, 1)
+        
+        return result
+
+    @classmethod
+    def _find_exif_location_in_iloc(cls, iloc_data: bytes, exif_item_id: int) -> int | None:
+        """Parse iloc box data to find Exif item location."""
+        if len(iloc_data) < 8:
+            return None
+        
+        version = iloc_data[0]
+        flags = iloc_data[1:4]
+        
+        # offset_size(4 bits) + length_size(4 bits) + base_offset_size(4 bits) + index_size(4 bits)
+        sizes = iloc_data[4]
+        offset_size = (sizes >> 4) & 0x0F
+        length_size = sizes & 0x0F
+        
+        if version == 1 or version == 2:
+            sizes2 = iloc_data[5]
+            base_offset_size = (sizes2 >> 4) & 0x0F
+            index_size = sizes2 & 0x0F
+            pos = 6
+        else:
+            base_offset_size = 0
+            index_size = 0
+            pos = 5
+        
+        # item_count
+        if pos + 2 > len(iloc_data):
+            return None
+        item_count = struct.unpack('>H', iloc_data[pos:pos+2])[0]
+        pos += 2
+        
+        for _ in range(item_count):
+            if pos + 2 > len(iloc_data):
+                break
+            
+            # item_id
+            item_id = struct.unpack('>H', iloc_data[pos:pos+2])[0]
+            pos += 2
+            
+            if version == 1 or version == 2:
+                # construction_method (for version 1 or 2)
+                if pos + 2 > len(iloc_data):
+                    break
+                pos += 2
+            
+            # data_reference_index
+            if pos + 2 > len(iloc_data):
+                break
+            data_ref_index = struct.unpack('>H', iloc_data[pos:pos+2])[0]
+            pos += 2
+            
+            # base_offset
+            if base_offset_size == 4:
+                if pos + 4 > len(iloc_data):
+                    break
+                base_offset = struct.unpack('>I', iloc_data[pos:pos+4])[0]
+                pos += 4
+            elif base_offset_size == 8:
+                if pos + 8 > len(iloc_data):
+                    break
+                base_offset = struct.unpack('>Q', iloc_data[pos:pos+8])[0]
+                pos += 8
+            else:
+                base_offset = 0
+            
+            # extent_count
+            if pos + 2 > len(iloc_data):
+                break
+            extent_count = struct.unpack('>H', iloc_data[pos:pos+2])[0]
+            pos += 2
+            
+            for _ in range(extent_count):
+                # index (only for version 1 or 2 with index_size > 0)
+                if index_size > 0:
+                    if index_size == 4:
+                        pos += 4
+                    elif index_size == 8:
+                        pos += 8
+                
+                # extent_offset
+                if offset_size == 4:
+                    if pos + 4 > len(iloc_data):
+                        break
+                    extent_offset = struct.unpack('>I', iloc_data[pos:pos+4])[0]
+                    pos += 4
+                elif offset_size == 8:
+                    if pos + 8 > len(iloc_data):
+                        break
+                    extent_offset = struct.unpack('>Q', iloc_data[pos:pos+8])[0]
+                    pos += 8
+                else:
+                    extent_offset = 0
+                
+                # extent_length
+                if length_size == 4:
+                    if pos + 4 > len(iloc_data):
+                        break
+                    pos += 4
+                elif length_size == 8:
+                    if pos + 8 > len(iloc_data):
+                        break
+                    pos += 8
+                
+                # Check if this is our exif item
+                if item_id == exif_item_id:
+                    return base_offset + extent_offset
         
         return None
 
