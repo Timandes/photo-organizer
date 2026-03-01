@@ -63,30 +63,13 @@ class QuickTimeExtractor:
         # Parse atoms looking for moov
         dates: list[tuple[datetime, int]] = []  # (date, priority)
         
+        # First pass: scan from beginning (fast start files)
         f.seek(0)
-        end_scan = MAX_SCAN_SIZE
+        moov_found = cls._scan_for_moov(f, dates, from_end=False)
         
-        while f.tell() < end_scan:
-            atom = cls._read_atom_header(f)
-            if atom is None:
-                break
-            
-            atom_type, atom_size, atom_data = atom
-            
-            if atom_type == b'moov':
-                # Parse moov atom for metadata
-                cls._parse_moov(atom_data, f, dates, atom_size)
-                break  # moov contains all we need
-            elif atom_type == b'mdat':
-                # Media data - skip and continue
-                if atom_size > 0:
-                    remaining = atom_size - 8
-                    f.seek(remaining, 1)
-            else:
-                # Skip unknown atoms
-                if atom_size > 8:
-                    remaining = atom_size - 8
-                    f.seek(remaining, 1)
+        # If not found, try from end (common for MOV files)
+        if not moov_found:
+            moov_found = cls._scan_for_moov(f, dates, from_end=True)
 
         # Return date by priority
         if dates:
@@ -94,6 +77,77 @@ class QuickTimeExtractor:
             return dates[0][0]
 
         return None
+    
+    @classmethod
+    def _scan_for_moov(cls, f: BinaryIO, dates: list, from_end: bool) -> bool:
+        """Scan file for moov atom.
+        
+        Args:
+            f: File handle
+            dates: List to append found dates
+            from_end: If True, scan from end of file (for files where moov is after mdat)
+            
+        Returns:
+            True if moov was found and parsed
+        """
+        if from_end:
+            # Try to find moov at end of file (common for non-fast-start MOV files)
+            f.seek(0, 2)  # Seek to end
+            file_size = f.tell()
+            
+            # Scan backwards from end of file
+            # moov atom is typically within the last few MB of the file
+            scan_start = max(0, file_size - 10 * 1024 * 1024)  # Last 10MB
+            f.seek(scan_start)
+            
+            # Read and search for 'moov' marker
+            data = f.read(file_size - scan_start)
+            moov_marker = b'moov'
+            pos = 0
+            
+            while True:
+                idx = data.find(moov_marker, pos)
+                if idx == -1:
+                    break
+                
+                # Check if this is a valid atom (4 bytes before should be size)
+                if idx >= 4:
+                    atom_start = scan_start + idx - 4
+                    f.seek(atom_start)
+                    header = f.read(8)
+                    if len(header) == 8:
+                        size, atom_type = struct.unpack('>I4s', header)
+                        if atom_type == b'moov' and 8 <= size <= file_size - atom_start:
+                            cls._parse_moov(header, f, dates, size)
+                            return True
+                
+                pos = idx + 1
+            
+            return False
+        else:
+            # Scan from beginning
+            end_scan = MAX_SCAN_SIZE
+            
+            while f.tell() < end_scan:
+                atom = cls._read_atom_header(f)
+                if atom is None:
+                    break
+                
+                atom_type, atom_size, atom_data = atom
+                
+                if atom_type == b'moov':
+                    cls._parse_moov(atom_data, f, dates, atom_size)
+                    return True
+                elif atom_type == b'mdat':
+                    # Media data - skip, moov might be after it
+                    if atom_size > 0:
+                        remaining = atom_size - 8
+                        f.seek(remaining, 1)
+                elif atom_size > 8:
+                    remaining = atom_size - 8
+                    f.seek(remaining, 1)
+        
+        return False
 
     @classmethod
     def _verify_ftyp(cls, data: bytes) -> bool:
